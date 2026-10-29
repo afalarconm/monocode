@@ -396,6 +396,16 @@ const CORNER_TABS_LEAD: f32 = 7.;
 const CORNER_CONTROL_GAP: f32 = 4.;
 const CORNER_BUTTONS_WIDTH: f32 = 48. + 2. * CORNER_CONTROL_GAP;
 // TitleBar.tsx's labels, with their shortcuts.
+const HIDE_WORKSPACE_LABEL: &str = if cfg!(target_os = "macos") {
+    "Hide workspace (⌘⇧B)"
+} else {
+    "Hide workspace (Ctrl+Shift+B)"
+};
+const SHOW_WORKSPACE_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show workspace (⌘⇧B)"
+} else {
+    "Show workspace (Ctrl+Shift+B)"
+};
 const TOGGLE_SIDEBAR_LABEL: &str = if cfg!(target_os = "macos") {
     "Toggle Sidebar (⌘B)"
 } else {
@@ -4490,6 +4500,18 @@ impl Shell {
             TRAFFIC_LIGHTS
         }
     }
+    /// Only a workspace panel the user hid gets an expand button; app
+    /// surfaces (Inbox, Notes, Search, Monos) replace the panel themselves.
+    /// It needs the open project list, whose width already has room for it.
+    fn workspace_expand_shown(&self, cx: &App) -> bool {
+        self.workspace.classic_layout
+            && !self.workspace.sidebar_visible
+            && self.workspace.project_rail_open
+            && self.settings.is_none()
+            && !self.app_view_open()
+            && self.app_search.is_none()
+            && !self.mono_active(cx)
+    }
     fn navigation_width(&self) -> f32 {
         let closed = self.traffic_lights() + 3. * 24.;
         if self.workspace.classic_layout {
@@ -4565,6 +4587,16 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| this.visit(1, window, cx))),
             )
+            .when(self.workspace_expand_shown(cx), |d| {
+                d.child(
+                    icon_button("expand-workspace", SHOW_WORKSPACE_LABEL, "panel-left")
+                        .debug_selector(|| "expand-workspace".into())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)),
+                        ),
+                )
+            })
     }
     /// Settings fill the sidebar's place, so its toggle steps aside. Its
     /// slot stays, so nothing beside it moves.

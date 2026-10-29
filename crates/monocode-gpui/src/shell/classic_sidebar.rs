@@ -334,6 +334,22 @@ impl Shell {
                                     .child(self.file_search_button(cx))
                                     .child(
                                         icon_button(
+                                            "classic-collapse-workspace",
+                                            HIDE_WORKSPACE_LABEL,
+                                            "panel-left",
+                                        )
+                                        .debug_selector(|| "classic-collapse-workspace".into())
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.toggle_sidebar(window, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        icon_button(
                                             "classic-new-session",
                                             if cfg!(target_os = "macos") {
                                                 "New session (⌘T)"

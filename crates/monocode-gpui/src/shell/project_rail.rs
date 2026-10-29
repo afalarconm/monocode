@@ -46,6 +46,10 @@ struct RailActivity {
     last: u64,
     note: Option<String>,
 }
+/// Fork choice: the Monos roster stays out of the project list. The feature
+/// and its Settings page remain, so upstream merges stay clean. Tests still
+/// build the roster, since upstream suites exercise it.
+const SHOW_MONOS_SECTION: bool = cfg!(test);
 /// Repos idle for longer than this fold under "N older".
 const STALE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 fn rail_stale(activity: Option<&RailActivity>, now: u64) -> bool {
@@ -431,7 +435,7 @@ impl Shell {
             paths.sort_by_key(|path| std::cmp::Reverse(last(path)));
         };
         let mut rows = Vec::new();
-        if self.workspace.preferences.monos {
+        if SHOW_MONOS_SECTION && self.workspace.preferences.monos {
             rows.push(ProjectRailRow::Monos);
         }
         let projects = &self.workspace.projects;
@@ -2013,6 +2017,39 @@ impl Shell {
 mod tests {
     use super::*;
     use gpui::{EntityInputHandler, TestAppContext, VisualTestContext, size};
+
+    #[gpui::test]
+    fn original_workspace_panel_collapses_and_returns_with_visible_buttons(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = super::super::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1500.), px(900.)));
+        window
+            .update(visual, |shell, _, cx| shell.toggle_layout(cx))
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("expand-workspace").is_none());
+        let hide = visual.debug_bounds("classic-collapse-workspace").unwrap();
+        visual.simulate_click(hide.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(!shell.workspace.sidebar_visible)
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("classic-collapse-workspace").is_none());
+        let show = visual.debug_bounds("expand-workspace").unwrap();
+        visual.simulate_click(show.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.workspace.sidebar_visible)
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("expand-workspace").is_none());
+    }
 
     #[gpui::test]
     fn original_layout_keeps_project_icons_when_sessions_are_hidden(cx: &mut TestAppContext) {
