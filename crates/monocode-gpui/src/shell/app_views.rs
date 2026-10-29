@@ -1,6 +1,6 @@
 //! The three application destinations share one navigation and focus boundary.
 use super::*;
-use crate::{automations, inbox, notes};
+use crate::{automations, inbox, vault_notes};
 
 pub(super) use crate::workspace::AppView;
 
@@ -124,11 +124,6 @@ impl Shell {
             }))
     }
     pub(super) fn leave_app_views(&mut self, cx: &mut Context<Self>) {
-        if self.active_app_view == Some(AppView::Notes)
-            && let Some(notes) = &self.notes
-        {
-            notes.update(cx, |notes, cx| notes.flush(cx));
-        }
         self.active_app_view = None;
         self.invalidate_chrome(cx);
     }
@@ -214,26 +209,29 @@ impl Shell {
 
     pub(super) fn open_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prepare_app_view(window, cx);
+        let root = self.workspace.preferences.vault_root();
+        let project = self.workspace.project.clone();
+        let mapping = self.workspace.vault_products.clone();
         if self.notes.is_none() {
-            let view = cx.new(|cx| notes::Notes::new(self.store.clone(), cx));
+            let view = cx.new(|cx| vault_notes::VaultNotes::new(root.clone(), cx));
             self.app_view_events.push(cx.subscribe_in(
                 &view,
                 window,
-                |this, _, event: &notes::Event, window, cx| match event {
-                    notes::Event::Close => this.close_app_view(window, cx),
-                    notes::Event::OpenSource(id) => this.open(*id, window, cx),
-                    notes::Event::AddToChat(note) => this.note_to_chat(note.clone(), window, cx),
+                |this, _, event: &vault_notes::Event, window, cx| match event {
+                    vault_notes::Event::Close => this.close_app_view(window, cx),
+                    vault_notes::Event::MapProduct { project, product } => {
+                        this.workspace
+                            .vault_products
+                            .insert(project.clone(), product.clone());
+                        this.persist(cx);
+                    }
                 },
             ));
             self.notes = Some(view);
         }
         if let Some(notes) = &self.notes {
-            let cwd = self.workspace.project.clone();
-            let projects = self.workspace.projects.clone();
             notes.update(cx, |notes, cx| {
-                notes.set_appearances(self.workspace.project_appearance.clone(), cx);
-                notes.set_context(cwd, projects, cx);
-                notes.refresh(cx);
+                notes.set_context(root, project, mapping, cx)
             });
         }
         self.show_app_view(AppView::Notes, window, cx);
@@ -348,6 +346,8 @@ impl Shell {
         self.show_app_view(AppView::Automations, window, cx);
     }
 
+    /// The database Notes surface is no longer reachable; kept for upstream merges.
+    #[allow(dead_code)]
     fn note_to_chat(
         &mut self,
         note: monocode_core::notes::Note,
@@ -492,5 +492,56 @@ impl Shell {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod vault_surface_tests {
+    use crate::shell::tests::window;
+    use gpui::{TestAppContext, VisualTestContext, px, size};
+
+    #[gpui::test]
+    fn notes_surface_opens_the_vault_and_remembers_a_product_choice(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let root =
+            std::env::temp_dir().join(format!("monocode-vault-surface-{}", std::process::id()));
+        let note = root.join("Obsidian/20-Projects/geodb/sessions/2026-10-19-09_00-a.md");
+        std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+        std::fs::write(&note, "# a\n").unwrap();
+        let vault = root.join("Obsidian").to_string_lossy().into_owned();
+        let project = window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.preferences.vault_path = Some(vault);
+                shell.open_notes(w, cx);
+                shell.workspace.project.clone()
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1500.), px(900.)));
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("vault-chip-all").is_some());
+        // The current repo has no product yet, so the surface asks; choosing remembers it.
+        let choice = visual
+            .debug_bounds("vault-map-geodb")
+            .expect("the prompt is shown");
+        visual.simulate_click(choice.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .read_with(visual, |shell, _| {
+                assert_eq!(shell.workspace.vault_products[&project], "geodb");
+            })
+            .unwrap();
+        // Reopening the surface does not ask again.
+        window
+            .update(visual, |shell, w, cx| {
+                shell.close_app_view(w, cx);
+                shell.open_notes(w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("vault-chip-all").is_some());
+        assert!(visual.debug_bounds("vault-map-prompt").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

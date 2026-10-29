@@ -48,9 +48,10 @@ mod metal_tests;
 mod mobile;
 mod modal;
 mod monos;
-mod notes;
+// The database-backed Notes surface stays for upstream merges but is no
+// longer reachable: the Notes entry opens the vault.
 #[allow(dead_code)]
-mod vault_notes;
+mod notes;
 mod notifications;
 mod pane_layout;
 mod pane_motion;
@@ -88,6 +89,7 @@ mod theme;
 mod traffic_lights;
 mod transcript;
 mod usage_footer;
+mod vault_notes;
 mod visuals;
 mod window_state;
 mod workspace;

@@ -26,13 +26,19 @@ pub(crate) enum Event {
     },
 }
 
+type UrlOpener = Box<dyn Fn(&str, &mut App)>;
+type PathOpener = Box<dyn Fn(&Path, &mut App)>;
+
 /// A note is cut at this many bytes; a transcript can be megabytes.
 const NOTE_CAP_BYTES: usize = 512 * 1024;
 
 struct Loaded {
     front: Option<Frontmatter>,
+    /// What the tests assert on: the note's text, and the same text with
+    /// wikilinks rewritten to `file://` links as it is rendered.
+    #[cfg(test)]
     body: String,
-    /// `body` with wikilinks rewritten to `file://` links, as rendered.
+    #[cfg(test)]
     linked: String,
     truncated: bool,
     rows: Vec<MarkdownRow>,
@@ -57,8 +63,8 @@ pub(crate) struct VaultNotes {
     /// Frontmatter of notes already read, so search can match topic and tags
     /// without reading the whole vault.
     read_fronts: HashMap<PathBuf, Frontmatter>,
-    open_url: Box<dyn Fn(&str, &mut App)>,
-    open_path: Box<dyn Fn(&Path, &mut App)>,
+    open_url: UrlOpener,
+    open_path: PathOpener,
     root: PathBuf,
     project: String,
     mapping: HashMap<String, String>,
@@ -817,7 +823,9 @@ fn load(root: &Path, path: &Path, note: vault::Note, index: &vault::NameIndex) -
     }
     Loaded {
         front: note.front,
+        #[cfg(test)]
         body: note.body,
+        #[cfg(test)]
         linked,
         truncated: note.truncated,
         rows,
@@ -896,6 +904,8 @@ mod tests {
     use gpui::{Bounds, Pixels, TestAppContext, VisualTestContext, px, size};
     use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
+    type MapLog = Rc<RefCell<Vec<(String, String)>>>;
+
     /// A temp folder that removes itself; the GUI crate has no `tempfile`.
     pub(super) struct TempDir(PathBuf);
     impl Drop for TempDir {
@@ -967,13 +977,13 @@ mod tests {
         cx.simulate_click(at, Default::default());
         cx.run_until_parked();
     }
-    fn mapped(events: &Rc<RefCell<Vec<(String, String)>>>) -> Vec<(String, String)> {
+    fn mapped(events: &MapLog) -> Vec<(String, String)> {
         events.borrow().clone()
     }
     fn watch(
         view: &Entity<VaultNotes>,
         cx: &mut VisualTestContext,
-    ) -> (Rc<RefCell<Vec<(String, String)>>>, gpui::Subscription) {
+    ) -> (MapLog, gpui::Subscription) {
         let log = Rc::new(RefCell::new(Vec::new()));
         let sink = log.clone();
         let sub = cx.update(|_, cx| {

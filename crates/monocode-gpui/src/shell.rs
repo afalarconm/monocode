@@ -47,7 +47,6 @@ mod worktrees;
 use crate::{
     conversation::{Conversation, SessionChanged},
     input,
-    notes::Notes,
     pane_layout::{Edge, LayoutLeaf, Rect, SplitDir},
     pane_motion::PaneSlide,
     pickers::{ProjectPicked, ProjectPicker},
@@ -63,6 +62,7 @@ use crate::{
     terminal::{Terminal, TerminalEvent},
     theme::*,
     usage_footer::UsageFooter,
+    vault_notes::VaultNotes,
     workspace::{DockSide, TitleTab, VisitHistory, Workspace, project_name},
 };
 use gpui::{
@@ -687,7 +687,7 @@ pub(crate) struct Shell {
     folder_picker: Option<session_folders::Open>,
     pending_folder: Option<(i64, AnchorSlot)>,
     _session_clock: gpui::Task<()>,
-    notes: Option<Entity<Notes>>,
+    notes: Option<Entity<VaultNotes>>,
     inbox: Option<Entity<crate::inbox::Inbox>>,
     automations: Option<Entity<crate::automations::Automations>>,
     active_app_view: Option<app_views::AppView>,
