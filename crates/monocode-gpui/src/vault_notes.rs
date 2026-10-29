@@ -30,7 +30,7 @@ type UrlOpener = Box<dyn Fn(&str, &mut App)>;
 type PathOpener = Box<dyn Fn(&Path, &mut App)>;
 
 /// A note is cut at this many bytes; a transcript can be megabytes.
-const NOTE_CAP_BYTES: usize = 512 * 1024;
+const NOTE_CAP_BYTES: usize = 128 * 1024;
 
 struct Loaded {
     front: Option<Frontmatter>,
@@ -50,12 +50,25 @@ enum NoteView {
     Ready(Box<Loaded>),
     Failed(String),
 }
+/// A file's length and modified time, to tell whether a change signal was
+/// about the open note at all.
+type Stamp = (u64, std::time::SystemTime);
+
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    let meta = path.metadata().ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
 struct OpenNote {
     path: PathBuf,
     view: NoteView,
+    stamp: Option<Stamp>,
 }
 
 pub(crate) struct VaultNotes {
+    /// How many times a note was read, so tests can see a skipped reload.
+    #[cfg(test)]
+    loads: usize,
     /// Kept alive so the folder stays watched; dropped when the root changes.
     watch: Option<crate::fs_watch::Watch>,
     listener: Option<Task<()>>,
@@ -95,6 +108,8 @@ impl VaultNotes {
         });
         let typed = cx.subscribe(&query, |_, _, _: &input::Changed, cx| cx.notify());
         let mut this = Self {
+            #[cfg(test)]
+            loads: 0,
             watch: None,
             listener: None,
             open: None,
@@ -137,7 +152,8 @@ impl VaultNotes {
             self.selected = None;
             self.open = None;
         }
-        if root_changed {
+        // A vault that was unplugged at launch has no watch; try again on open.
+        if root_changed || self.watch.is_none() {
             self.start_watch(cx);
         }
         if root_changed || project_changed {
@@ -146,8 +162,9 @@ impl VaultNotes {
                 None if project_changed => self.scope = None,
                 None => {}
             }
-            self.refresh(cx);
         }
+        // Opening Notes always lists again: the vault may have come back.
+        self.refresh(cx);
         cx.notify();
     }
 
@@ -198,37 +215,50 @@ impl VaultNotes {
         self.open = Some(OpenNote {
             path: path.clone(),
             view: NoteView::Loading,
+            stamp: None,
         });
         self.load(path, cx);
     }
 
     /// (Re)reads the note, keeping what is on screen until the result arrives.
     fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.loads += 1;
+        }
+        // Taken before reading, so a write that lands mid-read still triggers
+        // the next reload.
+        if let Some(open) = self.open.as_mut().filter(|open| open.path == path) {
+            open.stamp = stamp_of(&path);
+        }
         let root = self.root.clone();
+        // Reading, indexing and parsing all stay off the UI thread.
         let work = {
             let (path, root) = (path.clone(), root.clone());
             cx.background_executor().spawn(async move {
-                let note = vault::read_note(&path, NOTE_CAP_BYTES);
+                let note = vault::read_note(&path, NOTE_CAP_BYTES)?;
                 let index = vault::NameIndex::new(&vault::list(&root, None).unwrap_or_default());
-                (note, index)
+                Ok::<_, String>(load(&root, &path, note, &index))
             })
         };
         cx.spawn(async move |this, cx| {
-            let (note, index) = work.await;
+            let loaded = work.await;
             let _ = this.update(cx, |this, cx| {
                 if this.open.as_ref().map(|open| &open.path) != Some(&path) {
                     return;
                 }
-                let view = match note {
-                    Ok(note) => {
-                        if let Some(front) = &note.front {
+                let view = match loaded {
+                    Ok(loaded) => {
+                        if let Some(front) = &loaded.front {
                             this.read_fronts.insert(path.clone(), front.clone());
                         }
-                        NoteView::Ready(Box::new(load(&root, &path, note, &index)))
+                        NoteView::Ready(Box::new(loaded))
                     }
                     Err(error) => NoteView::Failed(error),
                 };
-                this.open = Some(OpenNote { path, view });
+                if let Some(open) = this.open.as_mut() {
+                    open.view = view;
+                }
                 cx.notify();
             });
         })
@@ -283,11 +313,17 @@ impl VaultNotes {
             return;
         };
         if path.is_file() {
-            self.load(path, cx);
+            // Most signals are about other notes; leave an unchanged one alone.
+            let now = stamp_of(&path);
+            let same = now.is_some() && now == self.open.as_ref().and_then(|open| open.stamp);
+            if !same {
+                self.load(path, cx);
+            }
         } else {
             self.open = Some(OpenNote {
                 path,
                 view: NoteView::Gone,
+                stamp: None,
             });
             cx.notify();
         }
@@ -778,6 +814,33 @@ fn meta_lines(front: &Frontmatter) -> Vec<String> {
 /// Rewrites `[[target|alias]]` to a link the markdown renderer opens, or to
 /// plain text when the target does not resolve.
 fn link_wikilinks(text: &str, resolve: &dyn Fn(&str) -> Option<PathBuf>) -> String {
+    let mut out = String::new();
+    let mut fenced = false;
+    for line in text.split_inclusive('\n') {
+        let start = line.trim_start();
+        if start.starts_with("```") || start.starts_with("~~~") {
+            fenced = !fenced;
+            out.push_str(line);
+        } else if fenced {
+            out.push_str(line);
+        } else {
+            // Between backticks is inline code; `[[ -f x ]]` is shell, not a link.
+            for (ix, part) in line.split('`').enumerate() {
+                if ix > 0 {
+                    out.push('`');
+                }
+                if ix % 2 == 1 {
+                    out.push_str(part);
+                } else {
+                    out.push_str(&link_line(part, resolve));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn link_line(text: &str, resolve: &dyn Fn(&str) -> Option<PathBuf>) -> String {
     let mut out = String::new();
     let mut rest = text;
     while let Some(start) = rest.find("[[") {
@@ -1354,5 +1417,47 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(names(&view, cx), ["2026-10-01-08_00-only"]);
         assert!(view.read_with(cx, |v, _| v.open.is_none()));
+    }
+
+    #[test]
+    fn wikilinks_inside_code_are_left_alone() {
+        let resolve = |t: &str| matches!(t, "a" | "b").then(|| PathBuf::from(format!("/v/{t}.md")));
+        let text = "see `[[a]]` and\n```sh\n[[ -f x ]] [[b]]\n```\n[[a|x]]\n";
+        assert_eq!(
+            link_wikilinks(text, &resolve),
+            "see `[[a]]` and\n```sh\n[[ -f x ]] [[b]]\n```\n[x](file:///v/a.md)\n"
+        );
+    }
+
+    #[gpui::test]
+    fn a_vault_that_comes_back_is_picked_up_when_notes_reopens(cx: &mut TestAppContext) {
+        let tmp = tempdir();
+        let root = tmp.0.join("Obsidian");
+        let (view, cx) = open(cx, &root);
+        assert!(bounds(cx, "vault-missing").is_some());
+        write(&root, "20-Projects/geodb/sessions/2026-10-19-09_00-back.md");
+        // The surface calls set_context every time it opens, even for the same repo.
+        view.update(cx, |v, cx| {
+            v.set_context(root.clone(), String::new(), HashMap::new(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(names(&view, cx), ["2026-10-19-09_00-back"]);
+        assert!(bounds(cx, "vault-missing").is_none());
+    }
+
+    #[gpui::test]
+    fn an_unchanged_open_note_is_not_reread_on_a_vault_change(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        assert_eq!(view.read_with(cx, |v, _| v.loads), 1);
+        view.update(cx, |v, cx| v.on_disk_change(cx));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.loads), 1, "nothing changed");
+        write_text(&summary(&root), "# Longer now\n\nmore text\n");
+        view.update(cx, |v, cx| v.on_disk_change(cx));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.loads), 2, "the file changed");
+        assert_eq!(loaded(&view, cx).1, "# Longer now\n\nmore text\n");
     }
 }

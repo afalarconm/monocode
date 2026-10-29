@@ -246,6 +246,14 @@ impl NameIndex {
     }
 }
 
+/// True when `path` really lies under `root`, following symlinks.
+fn inside(root: &Path, path: &Path) -> bool {
+    match (root.canonicalize(), path.canonicalize()) {
+        (Ok(root), Ok(path)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
 fn with_md(link: &str) -> String {
     if link.ends_with(".md") {
         link.to_owned()
@@ -265,6 +273,7 @@ pub fn resolve_wikilink(
 ) -> Option<PathBuf> {
     let target = link.split('|').next()?.split('#').next()?.trim();
     if target.is_empty()
+        || Path::new(target).is_absolute()
         || Path::new(target)
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -273,12 +282,12 @@ pub fn resolve_wikilink(
     }
     let file = with_md(target);
     let vault_relative = root.join(&file);
-    if vault_relative.is_file() {
+    if vault_relative.is_file() && inside(root, &vault_relative) {
         return Some(vault_relative);
     }
     if let Some(dir) = from.parent() {
         let note_relative = dir.join(&file);
-        if note_relative.is_file() {
+        if note_relative.is_file() && inside(root, &note_relative) {
             return Some(note_relative);
         }
     }
@@ -296,6 +305,7 @@ pub fn resolve_wikilink(
         .get(&stem)?
         .iter()
         .max_by(|a, b| shared(a).cmp(&shared(b)).then_with(|| b.cmp(a)))
+        .filter(|path| inside(root, path))
         .cloned()
 }
 
@@ -497,6 +507,30 @@ mod tests {
         assert_eq!(r(&opp, "README"), Some(opp.clone()));
         assert_eq!(r(&summary, "missing"), None);
         assert_eq!(r(&summary, "../../../../outside"), None);
+    }
+
+    #[test]
+    fn wikilinks_cannot_leave_the_vault() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Obsidian");
+        let inside = write(&root, "inside.md", "i");
+        let outside = write(t.path(), "outside.md", "o");
+        let index = NameIndex::new(&list(&root, None).unwrap());
+        let from = root.join("home.md");
+        // An absolute target replaces the vault root when joined.
+        let absolute = outside.with_extension("").to_string_lossy().into_owned();
+        assert_eq!(resolve_wikilink(&root, &from, &absolute, &index), None);
+        assert_eq!(
+            resolve_wikilink(&root, &from, "inside", &index),
+            Some(inside)
+        );
+        #[cfg(unix)]
+        {
+            let elsewhere = t.path().join("elsewhere");
+            write(&elsewhere, "secret.md", "s");
+            std::os::unix::fs::symlink(&elsewhere, root.join("link")).unwrap();
+            assert_eq!(resolve_wikilink(&root, &from, "link/secret", &index), None);
+        }
     }
 
     #[test]
