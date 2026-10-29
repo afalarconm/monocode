@@ -189,6 +189,7 @@ impl Preferences {
     }
 
     /// The vault folder Notes reads.
+    #[allow(dead_code)]
     pub(crate) fn vault_root(&self) -> std::path::PathBuf {
         let set = self.vault_path.as_deref().map(str::trim).unwrap_or("");
         match set.strip_prefix("~/") {

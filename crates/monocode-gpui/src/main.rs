@@ -49,6 +49,8 @@ mod mobile;
 mod modal;
 mod monos;
 mod notes;
+#[allow(dead_code)]
+mod vault_notes;
 mod notifications;
 mod pane_layout;
 mod pane_motion;
