@@ -34,6 +34,7 @@ pub mod tool;
 pub mod transcript;
 pub mod usage;
 pub mod user_links;
+pub mod vault;
 pub mod visual;
 pub mod visual_bridge;
 
