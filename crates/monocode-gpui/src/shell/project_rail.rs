@@ -15,11 +15,68 @@ enum ProjectRailRow {
     Monos,
     Heading(&'static str),
     Group(String),
-    Project { path: String, grouped: bool },
+    /// `tall` rows carry a second line, so a change must remeasure the list.
+    Project {
+        path: String,
+        grouped: bool,
+        tall: bool,
+    },
+    /// The collapsed tail of repos with no recent activity.
+    Older {
+        count: usize,
+        open: bool,
+    },
     Gap,
     Empty,
 }
+/// What a project row says about its agents. Ordered loudest-last so `max`
+/// picks the state that most needs the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum RailState {
+    #[default]
+    Idle,
+    Work,
+    Done,
+    Need,
+}
+#[derive(Clone, Debug, Default)]
+struct RailActivity {
+    state: RailState,
+    /// Unix milliseconds of the newest session update; zero when unknown.
+    last: u64,
+    note: Option<String>,
+}
+/// Repos idle for longer than this fold under "N older".
+const STALE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+fn rail_stale(activity: Option<&RailActivity>, now: u64) -> bool {
+    // No recorded activity means a fresh project, which must stay visible.
+    activity.is_some_and(|a| {
+        a.state == RailState::Idle && a.last > 0 && now.saturating_sub(a.last) > STALE_MS
+    })
+}
+fn rail_age(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    match minutes {
+        0 => "now".into(),
+        1..=59 => format!("{minutes}m"),
+        60..=1439 => format!("{}h", minutes / 60),
+        1440..=10079 => format!("{}d", minutes / 1440),
+        _ => format!("{}w", minutes / 10080),
+    }
+}
+fn rail_dot(state: RailState) -> gpui::Div {
+    let dot = div().size(px(8.)).rounded_full().flex_shrink_0();
+    let fill = |rgb_value: u32| gpui::Hsla::from(rgb(rgb_value));
+    match state {
+        RailState::Need => dot.bg(fill(0xf87171)),
+        RailState::Done => dot.bg(fill(0x34d399)),
+        RailState::Work => dot.bg(fill(0xfbbf24)),
+        RailState::Idle => dot.border_1().border_color(content(0.3)),
+    }
+}
 pub(super) struct ProjectRailList {
+    activity: HashMap<String, RailActivity>,
+    older_open: bool,
     state: ListState,
     rows: Vec<ProjectRailRow>,
     compact: bool,
@@ -47,6 +104,8 @@ impl ProjectRailList {
             });
         });
         Self {
+            activity: HashMap::new(),
+            older_open: false,
             state,
             rows: Vec::new(),
             compact: false,
@@ -297,7 +356,7 @@ impl Shell {
                 )
                 .into_any();
         }
-        self.prepare_project_rail(compact);
+        self.prepare_project_rail(compact, cx);
         let owner = cx.weak_entity();
         let rows = list(self.project_rail_list.state.clone(), move |ix, _, cx| {
             owner
@@ -329,7 +388,48 @@ impl Shell {
             .child(self.project_rail_footer(compact, cx))
             .into_any_element()
     }
-    fn prepare_project_rail(&mut self, compact: bool) {
+    /// One pass over the session summaries: every project's loudest agent
+    /// state and its newest activity, so rows never rescan the history.
+    fn rail_activity(&self, cx: &App) -> HashMap<String, RailActivity> {
+        let mut out: HashMap<String, RailActivity> = HashMap::new();
+        for summary in self.session_summaries.values().filter(|s| !s.archived) {
+            let entry = out.entry(summary.cwd.clone()).or_default();
+            entry.last = entry.last.max(summary.updated_at);
+            let Some(view) = self.sessions.get(&summary.id) else {
+                continue;
+            };
+            let view = view.read(cx);
+            let (state, note) = if view.needs_approval() {
+                (
+                    RailState::Need,
+                    Some(format!("Waiting: {}", view.display_title())),
+                )
+            } else if !view.busy && self.unseen_finished.contains(&summary.id) {
+                (
+                    RailState::Done,
+                    Some(format!("Done: {}", view.display_title())),
+                )
+            } else if view.responding() {
+                (RailState::Work, None)
+            } else {
+                continue;
+            };
+            if state > entry.state {
+                entry.state = state;
+                entry.note = note;
+            }
+        }
+        out
+    }
+    fn prepare_project_rail(&mut self, compact: bool, cx: &App) {
+        let activity = self.rail_activity(cx);
+        let now = monocode_core::time::now_ms();
+        let last = |path: &str| activity.get(path).map_or(0, |a| a.last);
+        let tall = |path: &str| !compact && activity.get(path).is_some_and(|a| a.note.is_some());
+        // Stable sort: projects with equal (or no) activity keep their manual order.
+        let recent = |paths: &mut Vec<String>| {
+            paths.sort_by_key(|path| std::cmp::Reverse(last(path)));
+        };
         let mut rows = Vec::new();
         if self.workspace.preferences.monos {
             rows.push(ProjectRailRow::Monos);
@@ -344,7 +444,9 @@ impl Shell {
             if !compact {
                 rows.push(ProjectRailRow::Heading("Pinned"));
             }
+            // Pinned projects keep the order the user gave them.
             rows.extend(pinned.into_iter().map(|path| ProjectRailRow::Project {
+                tall: tall(&path),
                 path,
                 grouped: false,
             }));
@@ -355,7 +457,7 @@ impl Shell {
                 rows.push(ProjectRailRow::Heading("Groups"));
             }
             for group in &self.workspace.project_rail_groups {
-                let items: Vec<_> = projects
+                let mut items: Vec<_> = projects
                     .iter()
                     .filter(|p| {
                         !self.workspace.project_rail_pinned.contains(*p)
@@ -363,11 +465,13 @@ impl Shell {
                     })
                     .cloned()
                     .collect();
+                recent(&mut items);
                 if !compact {
                     rows.push(ProjectRailRow::Group(group.id.clone()));
                 }
                 if compact || !group.collapsed {
                     rows.extend(items.into_iter().map(|path| ProjectRailRow::Project {
+                        tall: tall(&path),
                         path,
                         grouped: !compact,
                     }));
@@ -376,30 +480,51 @@ impl Shell {
             rows.push(ProjectRailRow::Gap);
         }
         rows.push(ProjectRailRow::Heading("Projects"));
-        let mut count = 0;
-        for path in projects {
-            let grouped = self
-                .workspace
-                .project_rail_assignments
-                .get(path)
-                .is_some_and(|id| {
-                    self.workspace
-                        .project_rail_groups
-                        .iter()
-                        .any(|g| &g.id == id)
-                });
-            if !self.workspace.project_rail_pinned.contains(path) && !grouped {
-                count += 1;
-                rows.push(ProjectRailRow::Project {
-                    path: path.clone(),
-                    grouped: false,
-                });
+        let mut ungrouped: Vec<_> = projects
+            .iter()
+            .filter(|path| {
+                let grouped = self
+                    .workspace
+                    .project_rail_assignments
+                    .get(*path)
+                    .is_some_and(|id| {
+                        self.workspace
+                            .project_rail_groups
+                            .iter()
+                            .any(|g| &g.id == id)
+                    });
+                !self.workspace.project_rail_pinned.contains(*path) && !grouped
+            })
+            .cloned()
+            .collect();
+        recent(&mut ungrouped);
+        let count = ungrouped.len();
+        // The compact icon rail has no room for a fold, and the open project
+        // must never disappear from under the user.
+        let (stale, fresh): (Vec<_>, Vec<_>) = ungrouped.into_iter().partition(|path| {
+            !compact && *path != self.workspace.project && rail_stale(activity.get(path), now)
+        });
+        let project_row = |path: String| ProjectRailRow::Project {
+            tall: tall(&path),
+            path,
+            grouped: false,
+        };
+        rows.extend(fresh.into_iter().map(project_row));
+        if !stale.is_empty() {
+            let open = self.project_rail_list.older_open;
+            rows.push(ProjectRailRow::Older {
+                count: stale.len(),
+                open,
+            });
+            if open {
+                rows.extend(stale.into_iter().map(project_row));
             }
         }
         if count == 0 && self.workspace.project_rail_groups.is_empty() {
             rows.push(ProjectRailRow::Empty);
         }
         rows.push(ProjectRailRow::Gap);
+        self.project_rail_list.activity = activity;
         self.project_rail_list.update(rows, compact);
     }
     fn project_rail_list_row(
@@ -422,9 +547,10 @@ impl Shell {
                 .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(compact, cx)))
                 .unwrap_or_else(|| div().into_any()),
             ProjectRailRow::Heading(label) => self.project_rail_heading(label, compact, cx),
-            ProjectRailRow::Project { path, grouped } => {
+            ProjectRailRow::Project { path, grouped, .. } => {
                 self.project_rail_row(ix, path, compact, grouped, row_gap, cx)
             }
+            ProjectRailRow::Older { count, open } => self.project_rail_older_row(count, open, cx),
             ProjectRailRow::Group(id) => self.project_rail_group_header(id, cx),
             ProjectRailRow::Gap => div().h(px(8.)).into_any(),
             ProjectRailRow::Empty => div()
@@ -896,6 +1022,16 @@ impl Shell {
         };
         let name = group.name.clone();
         let collapsed = group.collapsed;
+        // A collapsed group still says when one of its repos needs attention.
+        let loudest = self
+            .workspace
+            .projects
+            .iter()
+            .filter(|p| self.workspace.project_rail_assignments.get(*p) == Some(&id))
+            .filter_map(|p| self.project_rail_list.activity.get(p))
+            .map(|a| a.state)
+            .max()
+            .unwrap_or_default();
         let context = id.clone();
         let options = id.clone();
         let drag_id = id.clone();
@@ -907,20 +1043,6 @@ impl Shell {
             .clone();
         let offset = self.project_rail_item_offset(&id, true);
         let dragging = self.project_rail_item_raised(&id, true);
-        let color = group
-            .custom_color
-            .as_ref()
-            .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
-            .or_else(|| {
-                group
-                    .color_index
-                    .and_then(|i| monocode_core::project_appearance::COLORS.get(i).copied())
-            });
-        let appearance = monocode_core::project_appearance::ProjectAppearance {
-            color,
-            mascot: group.mascot.clone(),
-            ..Default::default()
-        };
         let row = div()
             .w_full()
             .px_2()
@@ -961,11 +1083,7 @@ impl Shell {
                                 d.child(
                                     div()
                                         .group_hover("project-rail-group", |s| s.invisible())
-                                        .child(crate::project_settings::project_icon(
-                                            &appearance,
-                                            &id,
-                                            12.,
-                                        )),
+                                        .child(rail_dot(loudest)),
                                 )
                             })
                             .child(
@@ -1178,198 +1296,303 @@ impl Shell {
             .cloned();
         let appearance = self.appearance(&path);
         let seed = workspace::project_name(&path);
+        // The icon rail has no room for a dot, so it keeps the mascot.
         let mark = if appearance.logo.is_some() {
             self.project_mark(&path, 16.)
         } else {
             crate::project_settings::project_icon(&appearance, &seed, 12.)
         };
-        let row = div()
-            .id(("rail-project", ix))
-            .debug_selector(move || format!("rail-project-{ix}"))
-            .h(px(if row_gap { 33. } else { 32. }))
-            .pl(px(6.))
-            .pr_2()
-            .when(row_gap, |d| d.pb_px())
-            .when(grouped, |d| d.px_3())
-            .child(
-                div()
-                    .id(("rail-project-button", ix))
-                    .debug_selector(move || format!("rail-project-button-{ix}"))
-                    .group("project-rail-row")
-                    .role(Role::Button)
-                    .aria_label(format!("Switch project, {label}"))
-                    .aria_description(path.clone())
-                    .aria_selected(selected)
-                    .cursor_pointer()
-                    .size_full()
-                    .relative()
-                    .top(px(offset))
-                    .px_2()
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(content(1.))
-                    .opacity(if selected { 1. } else { 0.65 })
-                    .when(selected, |d| d.bg(content(0.1)))
-                    .hover(|s| s.bg(content(0.08)).opacity(1.))
-                    .child(
-                        div()
-                            .size(px(16.))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(!compact && !reordering, |d| {
-                                d.group_hover("project-rail-row", |s| s.invisible())
-                            })
-                            .child(mark),
-                    )
-                    .when(!compact, |d| {
-                        d.child(
+        let activity = self.project_rail_list.activity.get(&path).cloned();
+        let state = activity.as_ref().map_or(RailState::Idle, |a| a.state);
+        let note = activity
+            .as_ref()
+            .and_then(|a| a.note.clone())
+            .filter(|_| !compact);
+        let age = activity
+            .as_ref()
+            .filter(|a| a.last > 0)
+            .map(|a| rail_age(monocode_core::time::now_ms().saturating_sub(a.last)));
+        let accent = rgb(appearance.color(&path));
+        let tall = note.is_some();
+        let row =
+            div()
+                .id(("rail-project", ix))
+                .debug_selector(move || format!("rail-project-{ix}"))
+                .h(px(if tall {
+                    46.
+                } else if row_gap {
+                    33.
+                } else {
+                    32.
+                }))
+                .pl(px(6.))
+                .pr_2()
+                .when(row_gap, |d| d.pb_px())
+                .when(grouped, |d| d.px_3())
+                .child(
+                    div()
+                        .id(("rail-project-button", ix))
+                        .debug_selector(move || format!("rail-project-button-{ix}"))
+                        .group("project-rail-row")
+                        .role(Role::Button)
+                        .aria_label(format!("Switch project, {label}"))
+                        .aria_description(path.clone())
+                        .aria_selected(selected)
+                        .cursor_pointer()
+                        .size_full()
+                        .relative()
+                        .top(px(offset))
+                        .px_2()
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(content(1.))
+                        .opacity(if selected { 1. } else { 0.65 })
+                        .when(selected, |d| d.bg(content(0.1)))
+                        .hover(|s| s.bg(content(0.08)).opacity(1.))
+                        .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .when(!reordering, |d| {
-                                    d.group_hover("project-rail-row", |s| s.pr(px(24.)))
+                                .size(px(16.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(!compact && !reordering, |d| {
+                                    d.group_hover("project-rail-row", |s| s.invisible())
                                 })
-                                .child(label),
+                                .child(if compact {
+                                    mark
+                                } else {
+                                    rail_dot(state).into_any_element()
+                                }),
                         )
-                    })
-                    .when(!compact, |d| {
-                        d.when_some(stats, |d, stats| {
+                        .when(!compact, |d| {
+                            // The project's colour survives as a thin edge accent.
                             d.child(
                                 div()
-                                    .flex_shrink_0()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(7.))
+                                    .bottom(px(7.))
+                                    .w(px(2.))
+                                    .rounded_full()
+                                    .bg(gpui::Hsla::from(accent)),
+                            )
+                        })
+                        .when(!compact, |d| {
+                            d.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .flex()
-                                    .gap_1()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .font_features(tabular())
+                                    .flex_col()
                                     .when(!reordering, |d| {
-                                        d.group_hover("project-rail-row", |s| s.invisible())
+                                        d.group_hover("project-rail-row", |s| s.pr(px(24.)))
                                     })
-                                    .when(stats.additions > 0, |d| {
+                                    .child(div().truncate().child(label))
+                                    .when_some(note, |d, note| {
                                         d.child(
-                                            div().text_color(rgb(DIFF_ADD)).child(format!(
-                                                "+{}",
-                                                format_integer(stats.additions)
-                                            )),
-                                        )
-                                    })
-                                    .when(stats.deletions > 0, |d| {
-                                        d.child(
-                                            div().text_color(rgb(DIFF_DEL)).child(format!(
-                                                "-{}",
-                                                format_integer(stats.deletions)
-                                            )),
+                                            div()
+                                                .truncate()
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::NORMAL)
+                                                .text_color(content(0.55))
+                                                .child(note),
                                         )
                                     }),
                             )
                         })
-                    })
-                    .when(!compact && !reordering, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left_2()
-                                .top(px(8.))
-                                .invisible()
-                                .group_hover("project-rail-row", |s| s.visible())
-                                .child(
-                                    icon_button(
-                                        "rail-pin-project",
-                                        if pinned {
-                                            "Unpin project"
-                                        } else {
-                                            "Pin project"
-                                        },
-                                        if pinned { "pin-off" } else { "pin" },
-                                    )
-                                    .size(px(16.))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
+                        .when(!compact, |d| {
+                            d.when_some(stats, |d, stats| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .gap_1()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .font_features(tabular())
+                                        .when(!reordering, |d| {
+                                            d.group_hover("project-rail-row", |s| s.invisible())
+                                        })
+                                        .when(stats.additions > 0, |d| {
+                                            d.child(div().text_color(rgb(DIFF_ADD)).child(format!(
+                                                "+{}",
+                                                format_integer(stats.additions)
+                                            )))
+                                        })
+                                        .when(stats.deletions > 0, |d| {
+                                            d.child(div().text_color(rgb(DIFF_DEL)).child(format!(
+                                                "-{}",
+                                                format_integer(stats.deletions)
+                                            )))
+                                        }),
+                                )
+                            })
+                        })
+                        .when_some(age.filter(|_| !compact), |d, age| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(content(0.4))
+                                    .when(!reordering, |d| {
+                                        d.group_hover("project-rail-row", |s| s.invisible())
                                     })
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_project_rail_pin(&pin_path, cx);
-                                        },
-                                    )),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .right_1()
-                                .top(px(4.))
-                                .invisible()
-                                .group_hover("project-rail-row", |s| s.visible())
-                                .child(
-                                    icon_button(
-                                        "rail-project-options",
-                                        "Project options",
-                                        "more-horizontal",
-                                    )
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(
-                                        move |this, e: &gpui::ClickEvent, window, cx| {
-                                            cx.stop_propagation();
-                                            this.open_menu(
-                                                MenuTarget::Project {
-                                                    path: options_path.clone(),
-                                                    rail: true,
+                                    .child(age),
+                            )
+                        })
+                        .when(!compact && !reordering, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .left_2()
+                                    .top(px(8.))
+                                    .invisible()
+                                    .group_hover("project-rail-row", |s| s.visible())
+                                    .child(
+                                        icon_button(
+                                            "rail-pin-project",
+                                            if pinned {
+                                                "Unpin project"
+                                            } else {
+                                                "Pin project"
+                                            },
+                                            if pinned { "pin-off" } else { "pin" },
+                                        )
+                                        .size(px(16.))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.toggle_project_rail_pin(&pin_path, cx);
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right_1()
+                                    .top(px(4.))
+                                    .invisible()
+                                    .group_hover("project-rail-row", |s| s.visible())
+                                    .child(
+                                        icon_button(
+                                            "rail-project-options",
+                                            "Project options",
+                                            "more-horizontal",
+                                        )
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(
+                                            cx.listener(
+                                                move |this, e: &gpui::ClickEvent, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_menu(
+                                                        MenuTarget::Project {
+                                                            path: options_path.clone(),
+                                                            rail: true,
+                                                        },
+                                                        Anchor::Point(e.position()),
+                                                        window,
+                                                        cx,
+                                                    );
                                                 },
-                                                Anchor::Point(e.position()),
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                                ),
+                                            ),
+                                        ),
+                                    ),
+                            )
+                        })
+                        .child(bounds.probe())
+                        .tooltip(move |_, cx| cx.new(|_| ProjectTooltip(tooltip.clone())).into())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if std::mem::take(&mut this.project_rail_list.skip_click) {
+                                return;
+                            }
+                            this.select_project(path.clone(), window, cx)
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                // Only pinned rows keep a manual order; the rest sort by recency.
+                                if pinned {
+                                    this.start_project_rail_drag(
+                                        drag_path.clone(),
+                                        false,
+                                        e,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }),
                         )
-                    })
-                    .child(bounds.probe())
-                    .tooltip(move |_, cx| cx.new(|_| ProjectTooltip(tooltip.clone())).into())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if std::mem::take(&mut this.project_rail_list.skip_click) {
-                            return;
-                        }
-                        this.select_project(path.clone(), window, cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                            this.start_project_rail_drag(drag_path.clone(), false, e, window, cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                            this.open_menu(
-                                MenuTarget::Project {
-                                    path: menu_path.clone(),
-                                    rail: true,
-                                },
-                                Anchor::Point(e.position),
-                                window,
-                                cx,
-                            );
-                            cx.stop_propagation();
-                        }),
-                    ),
-            )
-            .into_any_element();
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                this.open_menu(
+                                    MenuTarget::Project {
+                                        path: menu_path.clone(),
+                                        rail: true,
+                                    },
+                                    Anchor::Point(e.position),
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+                .into_any_element();
         if raised {
             gpui::deferred(row).with_priority(1).into_any()
         } else {
             row
         }
+    }
+    fn project_rail_older_row(
+        &mut self,
+        count: usize,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("rail-older")
+            .role(Role::Button)
+            .aria_label(format!("{count} older projects"))
+            .aria_expanded(open)
+            .h(px(28.))
+            .mx_2()
+            .px_2()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(12.))
+            .text_color(content(0.5))
+            .cursor_pointer()
+            .hover(|s| s.bg(content(0.08)).text_color(content(0.8)))
+            .child(icon(
+                if open {
+                    "chevron-down"
+                } else {
+                    "chevron-right"
+                },
+                12.,
+            ))
+            .child(format!("{count} older"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.project_rail_list.older_open = !this.project_rail_list.older_open;
+                this.projects_frame.update(cx, |_, cx| cx.notify());
+            }))
+            .into_any_element()
     }
     pub(super) fn reveal_active_project_rail(&self) {
         if let Some(ix) = self.project_rail_list.rows.iter().position(
@@ -1977,6 +2200,14 @@ mod tests {
                 shell.focus_workspace(w, cx);
             })
             .unwrap();
+        // Only pinned rows keep a manual order; the rest sort by recent activity.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.toggle_project_rail_pin("/rail/a", cx);
+                shell.toggle_project_rail_pin("/rail/b", cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
         let a = visual.debug_bounds("rail-project-button-0").unwrap();
         let b = visual.debug_bounds("rail-project-button-1").unwrap();
         visual.simulate_mouse_down(a.center(), MouseButton::Left, Default::default());
@@ -1992,6 +2223,21 @@ mod tests {
                 let saved = locked(&shell.store).unwrap().ui_state().unwrap().unwrap();
                 let restored = workspace::Workspace::restore(Some(&saved), &[], "/rail/a");
                 assert_eq!(restored.projects, shell.workspace.projects);
+            })
+            .unwrap();
+        let c = visual.debug_bounds("rail-project-button-2").unwrap();
+        let d = visual.debug_bounds("rail-project-button-3").unwrap();
+        visual.simulate_mouse_down(c.center(), MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(d.center(), MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(d.center(), MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert_eq!(
+                    shell.workspace.projects,
+                    vec!["/rail/b", "/rail/a", "/rail/c", "/rail/d"],
+                    "unpinned rows sort by recent activity and are not draggable"
+                );
             })
             .unwrap();
         let second = visual.debug_bounds("rail-group-second").unwrap();
@@ -2149,5 +2395,49 @@ mod tests {
                 assert!(shell.sessions.contains_key(&active));
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rail_activity_tests {
+    use super::*;
+    const MIN: u64 = 60_000;
+    const DAY: u64 = 24 * 60 * MIN;
+    fn idle(last: u64) -> RailActivity {
+        RailActivity {
+            last,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn ages_use_the_largest_whole_unit() {
+        assert_eq!(rail_age(30_000), "now");
+        assert_eq!(rail_age(59 * MIN), "59m");
+        assert_eq!(rail_age(2 * 60 * MIN), "2h");
+        assert_eq!(rail_age(3 * DAY), "3d");
+        assert_eq!(rail_age(21 * DAY), "3w");
+    }
+    #[test]
+    fn only_long_idle_projects_with_a_known_time_go_stale() {
+        let now = 100 * DAY;
+        assert!(rail_stale(Some(&idle(now - 15 * DAY)), now));
+        assert!(!rail_stale(Some(&idle(now - 13 * DAY)), now));
+        // Fresh projects have no recorded activity and must stay visible.
+        assert!(!rail_stale(Some(&idle(0)), now));
+        assert!(!rail_stale(None, now));
+        for state in [RailState::Work, RailState::Done, RailState::Need] {
+            let active = RailActivity {
+                state,
+                last: now - 30 * DAY,
+                note: None,
+            };
+            assert!(!rail_stale(Some(&active), now));
+        }
+    }
+    #[test]
+    fn the_loudest_state_wins() {
+        assert!(RailState::Need > RailState::Done);
+        assert!(RailState::Done > RailState::Work);
+        assert!(RailState::Work > RailState::Idle);
     }
 }
