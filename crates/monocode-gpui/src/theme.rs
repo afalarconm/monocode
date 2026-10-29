@@ -441,6 +441,7 @@ pub(crate) fn provider_icon(provider: &str, side: f32) -> Div {
         "fx" => ("fx.svg", true, 1.),
         "hermes" => ("hermes.svg", true, 0.72),
         "devin" => ("devin.svg", true, 0.88),
+        "kiro" => ("kiro.svg", true, 0.9),
         _ => ("codex.svg", false, 1.),
     };
     // Like React's currentColor / CSS masks, GPUI's SVG mask follows the theme.

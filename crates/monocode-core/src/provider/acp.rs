@@ -564,7 +564,7 @@ impl Protocol {
                     || lower.contains("no such session")
                     || (lower.contains("session") && lower.contains("not found"));
                 let replace = match kind {
-                    Kind::Cursor | Kind::Grok | Kind::Fx | Kind::Hermes => true,
+                    Kind::Cursor | Kind::Grok | Kind::Fx | Kind::Hermes | Kind::Kiro => true,
                     Kind::Antigravity => !timed_out,
                     Kind::Devin => !timed_out && devin_missing,
                     _ => false,

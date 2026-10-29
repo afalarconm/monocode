@@ -12,9 +12,10 @@ pub enum Kind {
     Fx,
     Hermes,
     Devin,
+    Kiro,
 }
 impl Kind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Claude,
         Self::Codex,
         Self::Cursor,
@@ -26,6 +27,7 @@ impl Kind {
         Self::Hermes,
         Self::Antigravity,
         Self::Devin,
+        Self::Kiro,
     ];
     pub fn id(self) -> &'static str {
         match self {
@@ -40,6 +42,7 @@ impl Kind {
             Self::Fx => "fx",
             Self::Hermes => "hermes",
             Self::Devin => "devin",
+            Self::Kiro => "kiro",
         }
     }
     pub fn label(self) -> &'static str {
@@ -55,6 +58,7 @@ impl Kind {
             Self::Fx => "fx",
             Self::Hermes => "Hermes Agent",
             Self::Devin => "Devin",
+            Self::Kiro => "Kiro CLI",
         }
     }
     pub fn parse(id: &str) -> Option<Self> {
@@ -67,6 +71,7 @@ impl Kind {
         match self {
             Self::Cursor => "cursor-agent",
             Self::Antigravity => "agy_acp_server.par",
+            Self::Kiro => "kiro-cli",
             _ => self.id(),
         }
     }
@@ -106,6 +111,7 @@ impl Kind {
             Self::Fx => "fx CLI",
             Self::Hermes => "Hermes Agent CLI",
             Self::Devin => "Devin CLI",
+            Self::Kiro => "Kiro CLI",
         }
     }
     /// The install command React shows in its hint, when it has one.
@@ -122,7 +128,12 @@ impl Kind {
             Self::Devin => Some("irm https://static.devin.ai/cli/setup.ps1 | iex"),
             #[cfg(not(windows))]
             Self::Devin => Some("curl -fsSL https://cli.devin.ai/install.sh | bash"),
-            Self::Codex | Self::Claude | Self::Cursor | Self::OpenCode | Self::Antigravity => None,
+            Self::Codex
+            | Self::Claude
+            | Self::Cursor
+            | Self::OpenCode
+            | Self::Antigravity
+            | Self::Kiro => None,
         }
     }
     /// The same "not found" copy React uses. React only checks that a binary
@@ -147,6 +158,10 @@ mod tests {
     fn registry_matches_the_react_harnesses() {
         let source = include_str!("../../../../src/integrations/harness/core/register.ts");
         for kind in Kind::ALL {
+            // Kiro is native-only: there is no React harness to compare against.
+            if kind == Kind::Kiro {
+                continue;
+            }
             assert_eq!(Kind::parse(kind.id()), Some(kind));
             assert!(source.contains(&format!("../providers/{}/", kind.id())));
         }
@@ -172,6 +187,9 @@ mod tests {
     fn hints_match_the_react_source() {
         let source = include_str!("../../../../src/integrations/harness/core/availability.ts");
         for kind in Kind::ALL {
+            if kind == Kind::Kiro {
+                continue;
+            }
             assert!(
                 source.contains(&format!("\"{}\"", kind.install_name())),
                 "React is missing the install name for {}",
