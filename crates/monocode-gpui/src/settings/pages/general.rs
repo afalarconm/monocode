@@ -1,4 +1,5 @@
 //! GeneralPage and UpdateRow.
+use crate::input::{self, Input};
 use crate::notifications::updater::{self, Action};
 use crate::settings::{
     SettingsView,
@@ -7,7 +8,52 @@ use crate::settings::{
 use crate::theme::*;
 use gpui::{AnyElement, Context, FontWeight, div, prelude::*, px};
 
+const VAULT_FIELD: &str = "vault-folder";
+
 impl SettingsView {
+    /// The Obsidian vault Notes reads. Applied on Return, so half-typed
+    /// paths never reach the Notes surface.
+    fn vault_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.fields.contains_key(VAULT_FIELD) {
+            let current = self.prefs.vault_path.clone().unwrap_or_default();
+            let input = cx.new(|cx| {
+                let mut input =
+                    Input::field(VAULT_FIELD, "~/ObsidianVaults/Obsidian", content(0.35), cx);
+                input.set_font_size(13.);
+                input.set_text(current, cx);
+                input
+            });
+            self._subscriptions.push(cx.subscribe(
+                &input,
+                |this, input, _: &input::Submitted, cx| {
+                    let value = input.read(cx).content.trim().to_owned();
+                    this.update(cx, |p| p.vault_path = (!value.is_empty()).then_some(value));
+                },
+            ));
+            self.fields.insert(VAULT_FIELD, input);
+        }
+        let input = self.fields[VAULT_FIELD].clone();
+        self.row(
+            Some("vault-folder"),
+            false,
+            "Vault folder",
+            Some("Where Notes reads your Obsidian vault. Press Return to apply. Leave empty for ~/ObsidianVaults/Obsidian.".into()),
+            vec![
+                div()
+                    .w(px(300.))
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(content(0.1))
+                    .bg(content(0.04))
+                    .flex()
+                    .items_center()
+                    .child(input)
+                    .into_any_element(),
+            ],
+        )
+    }
     pub(super) fn general_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = self.prefs.clone();
         let alerts = vec![
@@ -120,6 +166,8 @@ impl SettingsView {
                 ));controls},
             ));
         }
+        let vault = self.vault_row(cx);
+        workspace.push(vault);
         workspace.push(self.row(
             Some("working-agents"),
             false,

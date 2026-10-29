@@ -65,6 +65,8 @@ pub(crate) struct Preferences {
     pub idle_agents: u32,
     pub claude_hooks: bool,
     pub binary_paths: HashMap<String, String>,
+    /// Where Notes reads the Obsidian vault; `None` means the default folder.
+    pub vault_path: Option<String>,
     pub disabled_skill_paths: Vec<String>,
     pub skill_source_paths: Vec<String>,
     pub default_provider: Option<String>,
@@ -145,6 +147,7 @@ impl Default for Preferences {
             idle_agents: 3,
             claude_hooks: true,
             binary_paths: HashMap::new(),
+            vault_path: None,
             disabled_skill_paths: Vec::new(),
             skill_source_paths: Vec::new(),
             default_provider: None,
@@ -185,6 +188,18 @@ impl Preferences {
         }
     }
 
+    /// The vault folder Notes reads.
+    pub(crate) fn vault_root(&self) -> std::path::PathBuf {
+        let set = self.vault_path.as_deref().map(str::trim).unwrap_or("");
+        match set.strip_prefix("~/") {
+            Some(rest) if !rest.is_empty() => std::env::var_os("HOME").map_or_else(
+                || set.into(),
+                |home| std::path::PathBuf::from(home).join(rest),
+            ),
+            _ if set.is_empty() => monocode_core::vault::default_root(),
+            _ => set.into(),
+        }
+    }
     pub(crate) fn wayland_decorations(&self, compositor: &str) -> Option<gpui::WindowDecorations> {
         (compositor == "Wayland").then_some(if self.wayland_window_decorations {
             gpui::WindowDecorations::Server
@@ -281,5 +296,24 @@ mod decoration_tests {
         assert!(!restored.wayland_window_decorations);
         restored.restore_appearance();
         assert!(restored.wayland_window_decorations);
+    }
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::Preferences;
+    use std::path::PathBuf;
+
+    #[test]
+    fn vault_root_defaults_and_honours_the_setting() {
+        let mut prefs = Preferences::default();
+        assert_eq!(prefs.vault_root(), monocode_core::vault::default_root());
+        prefs.vault_path = Some("/tmp/v".into());
+        assert_eq!(prefs.vault_root(), PathBuf::from("/tmp/v"));
+        prefs.vault_path = Some("  ".into());
+        assert_eq!(prefs.vault_root(), monocode_core::vault::default_root());
+        prefs.vault_path = Some("~/notes".into());
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(prefs.vault_root(), home.join("notes"));
     }
 }

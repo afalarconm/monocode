@@ -130,6 +130,9 @@ pub(crate) struct Workspace {
     pub project_rail_pinned: HashSet<String>,
     pub project_rail_groups: Vec<ProjectRailGroup>,
     pub project_rail_assignments: HashMap<String, String>,
+    /// Project path to the vault product folder Notes pre-selects. An empty
+    /// string means the user was asked and skipped.
+    pub vault_products: HashMap<String, String>,
     pub classic_sidebar_tabs: HashMap<String, String>,
     pub classic_sidebar_tab_order: Vec<String>,
     pub new_layout_prompt_dismissed: bool,
@@ -332,6 +335,7 @@ impl Default for Workspace {
             project_rail_pinned: HashSet::new(),
             project_rail_groups: Vec::new(),
             project_rail_assignments: HashMap::new(),
+            vault_products: HashMap::new(),
             classic_sidebar_tabs: HashMap::new(),
             classic_sidebar_tab_order: Vec::new(),
             new_layout_prompt_dismissed: false,
@@ -1336,6 +1340,15 @@ mod tests {
         assert!(fresh.new_layout_boxy);
         let rounded = Workspace::restore(Some(r#"{"new_layout_boxy":false}"#), &sessions, "/a");
         assert!(!rounded.new_layout_boxy);
+    }
+    #[test]
+    fn vault_products_survive_a_save_and_restore() {
+        let mut state = Workspace::default();
+        state.vault_products.insert("/r/a".into(), "geodb".into());
+        state.vault_products.insert("/r/b".into(), String::new());
+        let json = serde_json::to_string(&state).unwrap();
+        let restored = Workspace::restore(Some(&json), &[], "/r/a");
+        assert_eq!(restored.vault_products, state.vault_products);
     }
     #[test]
     fn restoring_history_keeps_only_remembered_or_selected_projects() {
