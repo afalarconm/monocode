@@ -1,5 +1,6 @@
 //! The Notes surface: a read-only window onto the Obsidian vault. The vault's
 //! files are the only copy; nothing here writes to them.
+use crate::markdown::{self, MarkdownRow, Part, Tone};
 use crate::{
     input::{self, Input},
     theme::*,
@@ -8,10 +9,11 @@ use gpui::{
     AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     IntoElement, Role, SharedString, Stateful, Subscription, Window, div, prelude::*, px,
 };
-use monocode_core::vault::{self, Entry};
+use monocode_core::vault::{self, Entry, Frontmatter};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 pub(crate) enum Event {
@@ -24,7 +26,34 @@ pub(crate) enum Event {
     },
 }
 
+/// A note is cut at this many bytes; a transcript can be megabytes.
+const NOTE_CAP_BYTES: usize = 512 * 1024;
+
+struct Loaded {
+    front: Option<Frontmatter>,
+    body: String,
+    /// `body` with wikilinks rewritten to `file://` links, as rendered.
+    linked: String,
+    truncated: bool,
+    rows: Vec<MarkdownRow>,
+}
+enum NoteView {
+    Loading,
+    Ready(Box<Loaded>),
+    Failed(String),
+}
+struct OpenNote {
+    path: PathBuf,
+    view: NoteView,
+}
+
 pub(crate) struct VaultNotes {
+    open: Option<OpenNote>,
+    /// Frontmatter of notes already read, so search can match topic and tags
+    /// without reading the whole vault.
+    read_fronts: HashMap<PathBuf, Frontmatter>,
+    open_url: Box<dyn Fn(&str, &mut App)>,
+    open_path: Box<dyn Fn(&Path, &mut App)>,
     root: PathBuf,
     project: String,
     mapping: HashMap<String, String>,
@@ -55,6 +84,10 @@ impl VaultNotes {
         });
         let typed = cx.subscribe(&query, |_, _, _: &input::Changed, cx| cx.notify());
         let mut this = Self {
+            open: None,
+            read_fronts: HashMap::new(),
+            open_url: Box::new(|url, cx| cx.open_url(url)),
+            open_path: Box::new(|path, cx| cx.open_with_system(path)),
             root,
             project: String::new(),
             mapping: HashMap::new(),
@@ -88,6 +121,7 @@ impl VaultNotes {
         if root_changed {
             self.scope = None;
             self.selected = None;
+            self.open = None;
         }
         if root_changed || project_changed {
             match self.mapping.get(&self.project).filter(|p| !p.is_empty()) {
@@ -140,6 +174,57 @@ impl VaultNotes {
         .detach();
     }
 
+    /// Reads the note off the UI thread, along with a name index for its
+    /// wikilinks. Only paths are listed; no other file is read.
+    fn select(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.selected = Some(path.clone());
+        self.open = Some(OpenNote {
+            path: path.clone(),
+            view: NoteView::Loading,
+        });
+        let root = self.root.clone();
+        let work = {
+            let (path, root) = (path.clone(), root.clone());
+            cx.background_executor().spawn(async move {
+                let note = vault::read_note(&path, NOTE_CAP_BYTES);
+                let index = vault::NameIndex::new(&vault::list(&root, None).unwrap_or_default());
+                (note, index)
+            })
+        };
+        cx.spawn(async move |this, cx| {
+            let (note, index) = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.open.as_ref().map(|open| &open.path) != Some(&path) {
+                    return;
+                }
+                let view = match note {
+                    Ok(note) => {
+                        if let Some(front) = &note.front {
+                            this.read_fronts.insert(path.clone(), front.clone());
+                        }
+                        NoteView::Ready(Box::new(load(&root, &path, note, &index)))
+                    }
+                    Err(error) => NoteView::Failed(error),
+                };
+                this.open = Some(OpenNote { path, view });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A raw transcript's summary lives one folder up under the same name.
+    fn summary_of(path: &Path) -> Option<PathBuf> {
+        let raw = path
+            .parent()
+            .filter(|d| d.file_name().is_some_and(|n| n == "raw"))?;
+        let sessions = raw
+            .parent()
+            .filter(|d| d.file_name().is_some_and(|n| n == "sessions"))?;
+        Some(sessions.join(path.file_name()?)).filter(|p| p.is_file())
+    }
+
     fn set_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
@@ -174,7 +259,17 @@ impl VaultNotes {
         let query = query.trim();
         self.entries
             .iter()
-            .filter(|e| query.is_empty() || e.name.to_lowercase().contains(query))
+            .filter(|e| {
+                query.is_empty()
+                    || e.name.to_lowercase().contains(query)
+                    || self.read_fronts.get(&e.path).is_some_and(|front| {
+                        front
+                            .topic
+                            .as_deref()
+                            .is_some_and(|t| t.to_lowercase().contains(query))
+                            || front.tags.iter().any(|t| t.to_lowercase().contains(query))
+                    })
+            })
             .collect()
     }
 
@@ -253,6 +348,162 @@ impl VaultNotes {
         )
     }
 
+    fn detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(open) = &self.open else {
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_size(px(13.))
+                .text_color(content(0.45))
+                .child(icon("note", 24.))
+                .child("Select a note")
+                .into_any_element();
+        };
+        let title = match &open.view {
+            NoteView::Ready(note) => note.front.as_ref().and_then(|f| f.topic.clone()),
+            _ => None,
+        }
+        .or_else(|| {
+            open.path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+        let back = Self::summary_of(&open.path);
+        let mut actions = div().flex().flex_wrap().items_center().gap_1p5();
+        if let Some(summary) = back {
+            actions = actions.child(
+                chip(
+                    "Back to summary".into(),
+                    false,
+                    "vault-back-to-summary".into(),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.select(summary.clone(), cx))),
+            );
+        }
+        actions = actions
+            .child(
+                chip(
+                    "Open in Obsidian".into(),
+                    false,
+                    "vault-open-obsidian".into(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(open) = &this.open {
+                        let url = vault::obsidian_url(&this.root, &open.path);
+                        (this.open_url)(&url, cx);
+                    }
+                })),
+            )
+            .child(
+                chip(
+                    "Open with default app".into(),
+                    false,
+                    "vault-open-default".into(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(open) = &this.open {
+                        (this.open_path)(&open.path, cx);
+                    }
+                })),
+            );
+        let body: AnyElement = match &open.view {
+            NoteView::Loading => div()
+                .p_4()
+                .text_size(px(13.))
+                .text_color(content(0.45))
+                .child("Loading…")
+                .into_any_element(),
+            NoteView::Failed(error) => div()
+                .id("vault-error")
+                .debug_selector(|| "vault-error".into())
+                .p_4()
+                .text_size(px(13.))
+                .text_color(content(0.55))
+                .child(error.clone())
+                .into_any_element(),
+            NoteView::Ready(note) => {
+                let lines = note.front.as_ref().map(meta_lines).unwrap_or_default();
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .when(!lines.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .id("vault-meta")
+                                .debug_selector(|| "vault-meta".into())
+                                .px_4()
+                                .py_2()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .text_size(px(12.))
+                                .text_color(content(0.5))
+                                .children(lines),
+                        )
+                    })
+                    .when(note.truncated, |d| {
+                        d.child(
+                            div()
+                                .id("vault-truncated")
+                                .debug_selector(|| "vault-truncated".into())
+                                .px_4()
+                                .py_1()
+                                .text_size(px(12.))
+                                .text_color(content(0.55))
+                                .child(format!(
+                                    "Showing the first {} KB of this note.",
+                                    NOTE_CAP_BYTES / 1024
+                                )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("vault-body")
+                            .debug_selector(|| "vault-body".into())
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .px_4()
+                            .pb_4()
+                            .children(note_rows(&note.rows)),
+                    )
+                    .into_any_element()
+            }
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_4()
+                    .pt_3()
+                    .pb_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(actions),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
     fn list(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let visible: Vec<Entry> = self.visible(cx).into_iter().cloned().collect();
         // Folders in order of their newest note; rows stay newest first inside.
@@ -300,10 +551,7 @@ impl VaultNotes {
                         .hover(|s| s.bg(content(0.05)))
                         .when(active, |d| d.bg(content(0.1)))
                         .child(div().truncate().child(entry.name))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected = Some(path.clone());
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| this.select(path.clone(), cx)))
                         .into_any_element(),
                 );
             }
@@ -380,19 +628,7 @@ impl gpui::Render for VaultNotes {
                         )
                         .child(self.list(cx)),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap_3()
-                        .text_size(px(13.))
-                        .text_color(content(0.45))
-                        .child(icon("note", 24.))
-                        .child("Select a note"),
-                )
+                .child(self.detail(cx))
                 .into_any_element()
         };
         div()
@@ -403,6 +639,22 @@ impl gpui::Render for VaultNotes {
             .flex()
             .flex_col()
             .text_color(content(1.))
+            // Links to vault notes open here; anything else goes on to the app.
+            .on_action(
+                cx.listener(|this, event: &crate::file_editor::OpenPath, _, cx| {
+                    let (path, _) =
+                        crate::file_editor::file_location(&event.0, &this.root.to_string_lossy());
+                    let path = PathBuf::from(path);
+                    if path.starts_with(&this.root)
+                        && path.extension().is_some_and(|e| e == "md")
+                        && path.is_file()
+                    {
+                        this.select(path, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     cx.emit(Event::Close);
@@ -411,6 +663,140 @@ impl gpui::Render for VaultNotes {
             }))
             .child(body)
     }
+}
+
+/// The metadata header's lines: topic, when, status, tool and tags.
+fn meta_lines(front: &Frontmatter) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.extend(front.topic.clone());
+    let when: Vec<&str> = [front.date.as_deref(), front.time.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !when.is_empty() {
+        lines.push(when.join(" "));
+    }
+    if let Some(status) = &front.status {
+        lines.push(format!("status: {status}"));
+    }
+    let made: Vec<&str> = [front.tool.as_deref(), front.model.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !made.is_empty() {
+        lines.push(made.join(" · "));
+    }
+    if !front.tags.is_empty() {
+        lines.push(
+            front
+                .tags
+                .iter()
+                .map(|tag| format!("#{tag}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    lines
+}
+
+/// Rewrites `[[target|alias]]` to a link the markdown renderer opens, or to
+/// plain text when the target does not resolve.
+fn link_wikilinks(text: &str, resolve: &dyn Fn(&str) -> Option<PathBuf>) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]").filter(|end| !after[..*end].contains('\n')) else {
+            out.push_str("[[");
+            rest = after;
+            continue;
+        };
+        let (target, alias) = match after[..end].split_once('|') {
+            Some((target, alias)) => (target, Some(alias.trim())),
+            None => (&after[..end], None),
+        };
+        let name = target.split('#').next().unwrap_or(target).trim();
+        let shown = alias.filter(|a| !a.is_empty()).unwrap_or(name);
+        match resolve(name) {
+            Some(path) => out.push_str(&format!("[{shown}]({})", vault::file_url(&path))),
+            None => out.push_str(shown),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Turns a read note into what the pane renders: wikilinks rewritten, then
+/// the shared markdown rows with links resolved against the note's folder.
+fn load(root: &Path, path: &Path, note: vault::Note, index: &vault::NameIndex) -> Loaded {
+    let linked = link_wikilinks(&note.body, &|name| {
+        vault::resolve_wikilink(root, path, name, index)
+    });
+    let base = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut rows = Vec::new();
+    for block in &crate::markdown_model::parse_full_hard_breaks(&linked).blocks {
+        for mut row in markdown::rows(&block.block) {
+            markdown::resolve_file_links(&mut row, &base);
+            rows.push(row);
+        }
+    }
+    Loaded {
+        front: note.front,
+        body: note.body,
+        linked,
+        truncated: note.truncated,
+        rows,
+    }
+}
+
+/// The same row rendering the database notes use for their preview.
+fn note_rows(rows: &[MarkdownRow]) -> Vec<AnyElement> {
+    rows.iter()
+        .enumerate()
+        .map(|(ix, row)| {
+            let id: SharedString = format!("vault-markdown-{ix}").into();
+            let body: AnyElement = match &row.part {
+                Part::Code { fence, lines } => div()
+                    .id(id.clone())
+                    .overflow_x_scroll()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(content(0.1))
+                    .bg(content(0.03))
+                    .py_2()
+                    .child(markdown::code_lines(fence, lines.clone(), None, "", false))
+                    .into_any_element(),
+                _ => markdown::body(row, id, Tone::Normal, None, Instant::now()),
+            };
+            div()
+                .pt(px(row.gap))
+                .flex()
+                .min_w_0()
+                .gap_2()
+                .pl(px(row.indent as f32 * 16.))
+                .when(row.quote > 0, |d| {
+                    d.border_l_2().border_color(content(0.15)).pl_3()
+                })
+                .when_some(row.marker.clone(), |d, marker| {
+                    d.child(
+                        div()
+                            .w_4()
+                            .flex_shrink_0()
+                            .text_color(content(0.7))
+                            .text_size(px(14.))
+                            .line_height(px(24.))
+                            .child(marker),
+                    )
+                })
+                .child(div().flex_1().min_w_0().child(body))
+                .into_any_element()
+        })
+        .collect()
 }
 
 /// A filter or choice pill. The selector doubles as its element id.
@@ -632,5 +1018,197 @@ mod tests {
         let (view, cx) = open(cx, Path::new("/nope/not/here"));
         assert!(bounds(cx, "vault-missing").is_some());
         assert!(names(&view, cx).is_empty());
+    }
+
+    fn write_text(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    fn summary(root: &Path) -> PathBuf {
+        root.join("20-Projects/geodb/sessions/2026-10-19-09_00-sigex-batch.md")
+    }
+    fn raw(root: &Path) -> PathBuf {
+        root.join("20-Projects/geodb/sessions/raw/2026-10-19-09_00-sigex-batch.md")
+    }
+    fn select(view: &Entity<VaultNotes>, cx: &mut VisualTestContext, path: &Path) {
+        let path = path.to_path_buf();
+        view.update(cx, |v, cx| v.select(path, cx));
+        cx.run_until_parked();
+    }
+    /// What the open note loaded: (frontmatter, body, linked body, truncated).
+    fn loaded(
+        view: &Entity<VaultNotes>,
+        cx: &mut VisualTestContext,
+    ) -> (Option<Frontmatter>, String, String, bool) {
+        view.read_with(cx, |v, _| {
+            match &v.open.as_ref().expect("a note is open").view {
+                NoteView::Ready(note) => (
+                    note.front.clone(),
+                    note.body.clone(),
+                    note.linked.clone(),
+                    note.truncated,
+                ),
+                NoteView::Loading => panic!("still loading"),
+                NoteView::Failed(error) => panic!("failed to load: {error}"),
+            }
+        })
+    }
+
+    #[test]
+    fn unresolved_wikilinks_become_plain_text_and_aliases_are_used() {
+        let resolve = |t: &str| (t == "x").then(|| PathBuf::from("/v/x y.md"));
+        assert_eq!(
+            link_wikilinks("a [[x|Shown]] b [[nope]] c [[x#Head]]", &resolve),
+            "a [Shown](file:///v/x%20y.md) b nope c [x](file:///v/x%20y.md)"
+        );
+    }
+
+    #[gpui::test]
+    fn selecting_a_summary_shows_its_metadata_header_and_body(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        write_text(
+            &summary(&root),
+            "---\ndate: 2026-10-19\ntime: \"09:00\"\ntopic: sigex-batch\nstatus: landed\ntags: [geodb, sigex]\n---\n# Heading\n\nBody text\n",
+        );
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        let (front, body, _, truncated) = loaded(&view, cx);
+        let lines = meta_lines(&front.expect("frontmatter parsed"));
+        for wanted in ["sigex-batch", "2026-10-19", "landed", "#geodb"] {
+            assert!(
+                lines.iter().any(|l| l.contains(wanted)),
+                "{wanted} missing from {lines:?}"
+            );
+        }
+        assert!(!body.contains("---"));
+        assert!(!truncated);
+        assert!(bounds(cx, "vault-meta").is_some());
+        assert!(bounds(cx, "vault-body").is_some());
+    }
+
+    #[gpui::test]
+    fn a_note_without_frontmatter_has_no_header(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        write_text(&summary(&root), "# Plain\n\nJust text\n");
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        assert!(loaded(&view, cx).0.is_none());
+        assert!(bounds(cx, "vault-meta").is_none());
+        assert!(bounds(cx, "vault-body").is_some());
+    }
+
+    #[gpui::test]
+    fn clicking_a_wikilink_opens_the_target(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        write_text(
+            &summary(&root),
+            "See [[raw/2026-10-19-09_00-sigex-batch]] and [[nowhere]].\n",
+        );
+        write(
+            &root,
+            "20-Projects/geodb/sessions/raw/2026-10-19-09_00-sigex-batch.md",
+        );
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        let (_, _, linked, _) = loaded(&view, cx);
+        assert!(linked.contains(&monocode_core::vault::file_url(&raw(&root))));
+        assert!(!linked.contains("[["));
+        assert!(linked.contains("nowhere"));
+        // The renderer opens a link by dispatching OpenPath from inside the surface.
+        view.update_in(cx, |v, window, cx| {
+            window.focus(&v.query.focus_handle(cx), cx)
+        });
+        cx.dispatch_action(crate::file_editor::OpenPath(
+            monocode_core::vault::file_url(&raw(&root)),
+        ));
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.selected.clone()),
+            Some(raw(&root))
+        );
+    }
+
+    #[gpui::test]
+    fn a_raw_note_offers_a_link_back_to_its_summary(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        write(
+            &root,
+            "20-Projects/geodb/sessions/raw/2026-10-19-09_00-sigex-batch.md",
+        );
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        assert!(bounds(cx, "vault-back-to-summary").is_none());
+        select(&view, cx, &raw(&root));
+        click(cx, "vault-back-to-summary");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.selected.clone()),
+            Some(summary(&root))
+        );
+    }
+
+    #[gpui::test]
+    fn a_huge_note_is_cut_and_says_so(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        write_text(&summary(&root), &"x".repeat(2 * 1024 * 1024));
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        let (_, body, _, truncated) = loaded(&view, cx);
+        assert!(truncated);
+        assert!(body.len() <= NOTE_CAP_BYTES);
+        assert!(bounds(cx, "vault-truncated").is_some());
+    }
+
+    #[gpui::test]
+    fn an_unreadable_note_shows_an_error_row(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        std::fs::write(summary(&root), [0xff, 0xfe]).unwrap();
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        assert!(bounds(cx, "vault-error").is_some());
+        assert!(bounds(cx, "vault-body").is_none());
+    }
+
+    #[gpui::test]
+    fn open_in_obsidian_and_default_app_use_the_injected_openers(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        let (view, cx) = open(cx, &root);
+        let urls = Rc::new(RefCell::new(Vec::<String>::new()));
+        let paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let (u, p) = (urls.clone(), paths.clone());
+        view.update(cx, |v, _| {
+            v.open_url = Box::new(move |url, _| u.borrow_mut().push(url.to_owned()));
+            v.open_path = Box::new(move |path, _| p.borrow_mut().push(path.to_path_buf()));
+        });
+        select(&view, cx, &summary(&root));
+        click(cx, "vault-open-obsidian");
+        click(cx, "vault-open-default");
+        assert_eq!(
+            *urls.borrow(),
+            [monocode_core::vault::obsidian_url(&root, &summary(&root))]
+        );
+        assert_eq!(*paths.borrow(), [summary(&root)]);
+    }
+
+    #[gpui::test]
+    fn search_also_matches_topic_and_tags_of_notes_already_read(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        let front = "---\ntopic: zebra-topic\ntags: [quokka]\n---\nbody\n";
+        write_text(&summary(&root), front);
+        write_text(
+            &root.join("20-Projects/opportunity/sessions/2026-10-15-10_00-alerts.md"),
+            front,
+        );
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        let query = view.read_with(cx, |v, _| v.query.clone());
+        for term in ["zebra", "QUOKKA"] {
+            query.update(cx, |input, cx| input.set_text(term.into(), cx));
+            cx.run_until_parked();
+            let found: Vec<String> = view.read_with(cx, |v, cx| {
+                v.visible(cx).iter().map(|e| e.name.clone()).collect()
+            });
+            // The never-opened note has the same frontmatter but was not read.
+            assert_eq!(found, ["2026-10-19-09_00-sigex-batch"], "searching {term}");
+        }
     }
 }

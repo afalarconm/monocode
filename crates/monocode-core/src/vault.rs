@@ -311,6 +311,12 @@ fn percent_encode(text: &str) -> String {
     out
 }
 
+/// A `file://` link with every byte outside the unreserved set escaped, so
+/// names with spaces, unicode or `%` survive the markdown link round trip.
+pub fn file_url(path: &Path) -> String {
+    format!("file://{}", percent_encode(&path.to_string_lossy()))
+}
+
 /// `obsidian://open` for a file inside the vault. The vault name is the
 /// root folder's name.
 pub fn obsidian_url(root: &Path, file: &Path) -> String {
@@ -491,6 +497,14 @@ mod tests {
         assert_eq!(r(&opp, "README"), Some(opp.clone()));
         assert_eq!(r(&summary, "missing"), None);
         assert_eq!(r(&summary, "../../../../outside"), None);
+    }
+
+    #[test]
+    fn file_url_encodes_spaces_unicode_and_percent() {
+        assert_eq!(
+            file_url(Path::new("/v/Plan Ñandú 100%.md")),
+            "file:///v/Plan%20%C3%91and%C3%BA%20100%25.md"
+        );
     }
 
     #[test]
