@@ -16,6 +16,9 @@ const IGNORED_DIRS: &[&str] = &[
     "__pycache__",
     ".venv",
     "DerivedData",
+    // An Obsidian vault rewrites these constantly and they hold no notes.
+    ".obsidian",
+    ".trash",
 ];
 /// Parts of a Git directory that change without changing status.
 const IGNORED_GIT_DIRS: &[&str] = &["objects", "logs", "lfs", "hooks"];
@@ -91,6 +94,13 @@ mod tests {
         assert!(!relevant(Path::new("/repo/.git/index.lock")));
         assert!(!relevant(Path::new("/repo/target/debug/app")));
         assert!(!relevant(Path::new("/repo/web/node_modules/x/index.js")));
+    }
+
+    #[test]
+    fn obsidian_and_trash_changes_are_not_relevant() {
+        assert!(!relevant(Path::new("/v/.obsidian/workspace.json")));
+        assert!(!relevant(Path::new("/v/.trash/old.md")));
+        assert!(relevant(Path::new("/v/20-Projects/geodb/README.md")));
     }
 
     #[test]

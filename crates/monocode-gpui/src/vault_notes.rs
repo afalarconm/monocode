@@ -7,13 +7,13 @@ use crate::{
 };
 use gpui::{
     AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, Role, SharedString, Stateful, Subscription, Window, div, prelude::*, px,
+    IntoElement, Role, SharedString, Stateful, Subscription, Task, Window, div, prelude::*, px,
 };
 use monocode_core::vault::{self, Entry, Frontmatter};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(crate) enum Event {
@@ -39,6 +39,8 @@ struct Loaded {
 }
 enum NoteView {
     Loading,
+    /// The file was deleted while it was open.
+    Gone,
     Ready(Box<Loaded>),
     Failed(String),
 }
@@ -48,6 +50,9 @@ struct OpenNote {
 }
 
 pub(crate) struct VaultNotes {
+    /// Kept alive so the folder stays watched; dropped when the root changes.
+    watch: Option<crate::fs_watch::Watch>,
+    listener: Option<Task<()>>,
     open: Option<OpenNote>,
     /// Frontmatter of notes already read, so search can match topic and tags
     /// without reading the whole vault.
@@ -84,6 +89,8 @@ impl VaultNotes {
         });
         let typed = cx.subscribe(&query, |_, _, _: &input::Changed, cx| cx.notify());
         let mut this = Self {
+            watch: None,
+            listener: None,
             open: None,
             read_fronts: HashMap::new(),
             open_url: Box::new(|url, cx| cx.open_url(url)),
@@ -101,6 +108,7 @@ impl VaultNotes {
             _subscriptions: vec![typed],
         };
         this.refresh(cx);
+        this.start_watch(cx);
         this
     }
 
@@ -122,6 +130,9 @@ impl VaultNotes {
             self.scope = None;
             self.selected = None;
             self.open = None;
+        }
+        if root_changed {
+            self.start_watch(cx);
         }
         if root_changed || project_changed {
             match self.mapping.get(&self.project).filter(|p| !p.is_empty()) {
@@ -182,6 +193,11 @@ impl VaultNotes {
             path: path.clone(),
             view: NoteView::Loading,
         });
+        self.load(path, cx);
+    }
+
+    /// (Re)reads the note, keeping what is on screen until the result arrives.
+    fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let root = self.root.clone();
         let work = {
             let (path, root) = (path.clone(), root.clone());
@@ -223,6 +239,52 @@ impl VaultNotes {
             .parent()
             .filter(|d| d.file_name().is_some_and(|n| n == "sessions"))?;
         Some(sessions.join(path.file_name()?)).filter(|p| p.is_file())
+    }
+
+    fn start_watch(&mut self, cx: &mut Context<Self>) {
+        self.watch = None;
+        self.listener = None;
+        // Real file events would wake the test scheduler from outside it, so
+        // tests drive `listen` with their own channel instead.
+        if cfg!(test) {
+            return;
+        }
+        if let Some((watch, changes)) = crate::fs_watch::watch(std::slice::from_ref(&self.root)) {
+            self.watch = Some(watch);
+            self.listen(changes, cx);
+        }
+    }
+
+    /// Re-reads on each change signal once a burst of writes has settled.
+    fn listen(&mut self, changes: async_channel::Receiver<()>, cx: &mut Context<Self>) {
+        self.listener = Some(cx.spawn(async move |this, cx| {
+            while changes.recv().await.is_ok() {
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                while changes.try_recv().is_ok() {}
+                if this.update(cx, |this, cx| this.on_disk_change(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Lists again and re-reads the open note; a deleted one says so.
+    fn on_disk_change(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+        let Some(path) = self.open.as_ref().map(|open| open.path.clone()) else {
+            return;
+        };
+        if path.is_file() {
+            self.load(path, cx);
+        } else {
+            self.open = Some(OpenNote {
+                path,
+                view: NoteView::Gone,
+            });
+            cx.notify();
+        }
     }
 
     fn set_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
@@ -412,6 +474,14 @@ impl VaultNotes {
                 })),
             );
         let body: AnyElement = match &open.view {
+            NoteView::Gone => div()
+                .id("vault-gone")
+                .debug_selector(|| "vault-gone".into())
+                .p_4()
+                .text_size(px(13.))
+                .text_color(content(0.55))
+                .child("This note no longer exists.")
+                .into_any_element(),
             NoteView::Loading => div()
                 .p_4()
                 .text_size(px(13.))
@@ -1048,7 +1118,7 @@ mod tests {
                     note.linked.clone(),
                     note.truncated,
                 ),
-                NoteView::Loading => panic!("still loading"),
+                NoteView::Loading | NoteView::Gone => panic!("not loaded"),
                 NoteView::Failed(error) => panic!("failed to load: {error}"),
             }
         })
@@ -1210,5 +1280,69 @@ mod tests {
             // The never-opened note has the same frontmatter but was not read.
             assert_eq!(found, ["2026-10-19-09_00-sigex-batch"], "searching {term}");
         }
+    }
+
+    #[gpui::test]
+    fn a_new_file_appears_without_a_manual_refresh(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        let (view, cx) = open(cx, &root);
+        let before = names(&view, cx).len();
+        let (tx, rx) = async_channel::bounded(1);
+        view.update(cx, |v, cx| v.listen(rx, cx));
+        write(
+            &root,
+            "20-Projects/geodb/sessions/2026-10-25-08_00-fresh.md",
+        );
+        tx.try_send(()).unwrap();
+        // Nothing happens before the debounce has passed.
+        cx.run_until_parked();
+        assert_eq!(names(&view, cx).len(), before);
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        assert!(names(&view, cx).contains(&"2026-10-25-08_00-fresh".to_owned()));
+    }
+
+    #[gpui::test]
+    fn a_deleted_selected_note_says_it_no_longer_exists(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &summary(&root));
+        assert!(bounds(cx, "vault-body").is_some());
+        std::fs::remove_file(summary(&root)).unwrap();
+        view.update(cx, |v, cx| v.on_disk_change(cx));
+        cx.run_until_parked();
+        assert!(bounds(cx, "vault-gone").is_some());
+        assert!(bounds(cx, "vault-body").is_none());
+        assert!(!names(&view, cx).contains(&"2026-10-19-09_00-sigex-batch".to_owned()));
+    }
+
+    #[gpui::test]
+    fn a_half_written_file_does_not_break_refresh(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        let path = root.join("20-Projects/geodb/sessions/2026-10-26-08_00-wip.md");
+        write_text(&path, "");
+        let (view, cx) = open(cx, &root);
+        select(&view, cx, &path);
+        assert_eq!(loaded(&view, cx).1, "");
+        write_text(&path, "# Done writing\n");
+        view.update(cx, |v, cx| v.on_disk_change(cx));
+        cx.run_until_parked();
+        assert_eq!(loaded(&view, cx).1, "# Done writing\n");
+        assert!(bounds(cx, "vault-body").is_some());
+    }
+
+    #[gpui::test]
+    fn changing_the_root_restarts_the_watch_and_the_list(cx: &mut TestAppContext) {
+        let (_tmp, root) = vault();
+        let other_tmp = tempdir();
+        let other = other_tmp.0.join("Other");
+        write(&other, "20-Projects/solo/sessions/2026-10-01-08_00-only.md");
+        let (view, cx) = open(cx, &root);
+        view.update(cx, |v, cx| {
+            v.set_context(other.clone(), String::new(), HashMap::new(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(names(&view, cx), ["2026-10-01-08_00-only"]);
+        assert!(view.read_with(cx, |v, _| v.open.is_none()));
     }
 }
