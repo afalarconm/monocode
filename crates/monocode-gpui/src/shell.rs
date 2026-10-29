@@ -8350,6 +8350,7 @@ impl Render for Shell {
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
                     let cwd = this.git.read(cx).project().to_owned();
                     let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
+                    let path = this.locate_across_projects(path, &cwd);
                     this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
                     // Monos render above the session pane tree. Give its file
                     // an independent visible tab using the normal navigation

@@ -1561,6 +1561,37 @@ impl Shell {
             row
         }
     }
+    /// Links resolve against the chat's own repo, so a relative path the agent
+    /// meant for another repo points at a file that is not there. Retry the
+    /// same relative path under the user's other projects, newest first.
+    pub(super) fn locate_across_projects(&self, path: String, cwd: &str) -> String {
+        let found = std::path::Path::new(&path);
+        if path.starts_with("remote://") || found.exists() {
+            return path;
+        }
+        let Ok(relative) = found.strip_prefix(cwd) else {
+            return path;
+        };
+        let mut others: Vec<&String> = self
+            .workspace
+            .projects
+            .iter()
+            .filter(|p| p.as_str() != cwd && !p.starts_with("remote://"))
+            .collect();
+        others.sort_by_key(|p| {
+            std::cmp::Reverse(
+                self.project_rail_list
+                    .activity
+                    .get(*p)
+                    .map_or(0, |a| a.last),
+            )
+        });
+        others
+            .into_iter()
+            .map(|other| std::path::Path::new(other).join(relative))
+            .find(|candidate| candidate.exists())
+            .map_or(path, |candidate| candidate.to_string_lossy().into_owned())
+    }
     fn project_rail_older_row(
         &mut self,
         count: usize,
@@ -2017,6 +2048,44 @@ impl Shell {
 mod tests {
     use super::*;
     use gpui::{EntityInputHandler, TestAppContext, VisualTestContext, size};
+
+    #[gpui::test]
+    fn a_missing_relative_file_is_found_in_another_project(cx: &mut TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        let root = std::env::temp_dir().join(format!("monocode-cross-repo-{}", std::process::id()));
+        let (chat, other) = (root.join("chat"), root.join("other"));
+        std::fs::create_dir_all(chat.join("docs")).unwrap();
+        std::fs::create_dir_all(other.join("docs")).unwrap();
+        std::fs::write(other.join("docs/plan.md"), "# Plan").unwrap();
+        std::fs::write(chat.join("docs/here.md"), "# Here").unwrap();
+        let (chat_s, other_s) = (
+            chat.to_string_lossy().into_owned(),
+            other.to_string_lossy().into_owned(),
+        );
+        window
+            .update(cx, |shell, _, _| {
+                shell.workspace.projects = vec![chat_s.clone(), other_s.clone()];
+                let moved = shell.locate_across_projects(format!("{chat_s}/docs/plan.md"), &chat_s);
+                assert_eq!(moved, format!("{other_s}/docs/plan.md"));
+                // A file that exists where it was resolved is left alone.
+                let here = format!("{chat_s}/docs/here.md");
+                assert_eq!(shell.locate_across_projects(here.clone(), &chat_s), here);
+                // Nowhere to be found: keep the original so the error names it.
+                let missing = format!("{chat_s}/docs/none.md");
+                assert_eq!(
+                    shell.locate_across_projects(missing.clone(), &chat_s),
+                    missing
+                );
+                // Absolute paths outside the chat's repo are never rewritten.
+                let elsewhere = "/definitely/not/here.md".to_string();
+                assert_eq!(
+                    shell.locate_across_projects(elsewhere.clone(), &chat_s),
+                    elsewhere
+                );
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[gpui::test]
     fn original_workspace_panel_collapses_and_returns_with_visible_buttons(
