@@ -312,6 +312,14 @@ impl Store {
     pub fn uses_monocode_schema(&self) -> bool {
         self.shared.is_some()
     }
+    /// Where native-only tables live: the sidecar beside a desktop database,
+    /// which the desktop schema never sees, or a prototype database itself.
+    pub(super) fn native_db(&self) -> Option<&Connection> {
+        match &self.shared {
+            Some(shared) => shared.extras_db.as_ref(),
+            None => Some(&self.conn),
+        }
+    }
     /// A read-only snapshot of desktop preferences, shared by this store's
     /// consumers. Reopening the store refreshes it without per-message WebKit I/O.
     pub fn desktop_preferences(&self) -> Option<&crate::desktop_preferences::DesktopPreferences> {

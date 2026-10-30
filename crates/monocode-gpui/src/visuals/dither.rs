@@ -19,7 +19,7 @@ pub(crate) fn inked(col: i32, row: i32, tone: f32) -> bool {
 
 /// Whether the interface draws dark ink on a light surface. Glows turn
 /// muddy there, so they are softer.
-pub(super) fn light() -> bool {
+pub(crate) fn light() -> bool {
     content(1.).l < 0.5
 }
 
@@ -69,7 +69,7 @@ impl Grid {
 
 /// A soft bloom over `bounds`, inside as well as around it, so it shows
 /// through the gaps of a dithered fill painted on top.
-pub(super) fn glow(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla, strength: f32) {
+pub(crate) fn glow(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla, strength: f32) {
     let mut color = color;
     color.a = strength * if light() { 0.4 } else { 1. };
     // A drop shadow skips its own element; shrinking the element to a line
@@ -95,14 +95,14 @@ pub(super) fn glow(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla, str
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub(super) enum Align {
+pub(crate) enum Align {
     Left,
     Center,
     Right,
 }
 
 /// Small type for axes and captions.
-pub(super) struct Label {
+pub(crate) struct Label {
     pub size: f32,
     pub color: Hsla,
     pub mono: bool,
@@ -185,7 +185,7 @@ impl Label {
 /// A visual's entrance clock: charts draw themselves in once, from when the
 /// visual first appeared, unless the system asks for reduced motion.
 #[derive(Clone, Copy)]
-pub(super) struct Motion(pub std::time::Instant);
+pub(crate) struct Motion(pub std::time::Instant);
 impl Motion {
     /// Eased progress, 0 to 1, of a step lasting `ms` that starts `delay` ms
     /// in. Asks for another frame until it settles.
@@ -203,7 +203,7 @@ impl Motion {
 }
 
 /// The pointer, relative to `bounds`' origin, while it is over them.
-pub(super) fn pointer(bounds: Bounds<Pixels>, window: &Window) -> Option<(f32, f32)> {
+pub(crate) fn pointer(bounds: Bounds<Pixels>, window: &Window) -> Option<(f32, f32)> {
     let at = window.mouse_position();
     bounds.contains(&at).then(|| {
         (
@@ -214,7 +214,7 @@ pub(super) fn pointer(bounds: Bounds<Pixels>, window: &Window) -> Option<(f32, f
 }
 
 /// A chart canvas that repaints as the pointer moves over it and leaves.
-pub(super) fn hoverable(id: gpui::SharedString) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn hoverable(id: gpui::SharedString) -> gpui::Stateful<gpui::Div> {
     use gpui::{InteractiveElement, StatefulInteractiveElement, div};
     div()
         .id(id)
@@ -224,7 +224,7 @@ pub(super) fn hoverable(id: gpui::SharedString) -> gpui::Stateful<gpui::Div> {
 
 /// The details card next to a hovered point: a title, then one row per
 /// series with its swatch, name and value. Kept inside `bounds`.
-pub(super) fn readout(
+pub(crate) fn readout(
     title: &str,
     rows: &[(Hsla, String, String)],
     anchor: Point<Pixels>,
