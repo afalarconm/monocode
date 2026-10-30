@@ -53,10 +53,6 @@ pub(crate) fn thumbnail(source: impl Into<ImageSource>) -> Img {
 pub(crate) fn preview(source: impl Into<ImageSource>) -> Img {
     with_cache(source, |c| &c.previews)
 }
-/// `img` for content images, kept within the shared budget.
-pub(crate) fn image(source: impl Into<ImageSource>) -> Img {
-    with_cache(source, |c| &c.images)
-}
 /// The content cache, for images whose bytes come from somewhere GPUI cannot load.
 pub(crate) fn images(cx: &mut App) -> Entity<BoundedImages> {
     if let Some(images) = CACHES.with(|slot| slot.borrow().as_ref().map(|c| c.images.clone())) {
